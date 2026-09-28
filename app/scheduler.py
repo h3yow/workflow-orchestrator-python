@@ -19,8 +19,9 @@ import threading
 from .config import Settings
 from .executor import Executor, HandlerRegistry
 from .models import (
-    Rejected, RejectReason, Run, RunStatus, TaskRun, TaskStatus,
-    TERMINAL_TASK_STATES, Workflow, WorkflowSpec, check_transition,
+    ActiveRunPolicy, Rejected, RejectReason, RetentionPolicy, Run, RunStatus,
+    TaskRun, TaskStatus, TERMINAL_TASK_STATES, TriggerOutcome, TriggerResult,
+    Workflow, WorkflowSpec, check_transition,
     RUN_TRANSITIONS, TASK_TRANSITIONS, new_id, now,
 )
 from .storage import Storage
@@ -30,6 +31,7 @@ logger = logging.getLogger("orchestrator")
 # 事件类型（写入 events 表，供历史查询与恢复解释）
 EV_RUN_CREATED = "RUN_CREATED"
 EV_RUN_DEDUPED = "RUN_DEDUPED"
+EV_RUN_REUSED = "RUN_REUSED"
 EV_RUN_REJECTED = "RUN_REJECTED"
 EV_RUN_STARTED = "RUN_STARTED"
 EV_RUN_FINISHED = "RUN_FINISHED"
@@ -43,6 +45,12 @@ EV_TASK_FAILED = "TASK_FAILED"
 EV_TASK_TIMED_OUT = "TASK_TIMED_OUT"
 EV_RECOVERY = "RECOVERY"
 EV_LATE_RESULT = "LATE_RESULT_DISCARDED"
+
+# 审计事件类型（写入 audit_events 表，有界保留）
+AUDIT_TRIGGER_REUSED = "TRIGGER_REUSED"        # 触发被收敛为复用已有运行
+AUDIT_TRIGGER_REJECTED = "TRIGGER_REJECTED"    # 触发因活跃收敛被拒绝
+AUDIT_RETENTION_REAPED = "RETENTION_REAPED"    # 历史按保留策略被清理
+AUDIT_AUDIT_PRUNED = "AUDIT_PRUNED"            # 审计/墓碑自身被裁剪
 
 
 def validate_spec(spec: WorkflowSpec) -> None:
@@ -94,10 +102,13 @@ class Orchestrator:
         self._slots = threading.Semaphore(settings.max_concurrent_tasks)
         self._spec_cache: dict[str, WorkflowSpec] = {}
         self._sched_last: dict[str, float] = {}
+        self._last_cleanup = 0.0
+        self._cleaning = threading.Event()
 
     # ---- 工作流注册 ----
     def register_workflow(self, spec: WorkflowSpec) -> Workflow:
         validate_spec(spec)
+        self._validate_policies(spec)
         for t in spec.tasks:
             try:
                 self.registry.get(t.handler)
@@ -111,26 +122,111 @@ class Orchestrator:
                       spec=spec, created_at=now())
         self.storage.save_workflow(wf)
         self._spec_cache[wf.id] = spec
-        logger.info("workflow registered: %s owner=%s", spec.name, spec.owner)
+        logger.info("workflow registered: %s owner=%s policy=%s retention=%s",
+                    spec.name, spec.owner, spec.active_run_policy,
+                    spec.retention)
         return wf
+
+    def update_policies(self, owner: str, workflow_name: str,
+                        active_run_policy: str | None = None,
+                        retention: RetentionPolicy | None = None) -> Workflow:
+        """更新工作流的并发收敛策略与历史保留策略（持久化，重启后继续生效）。"""
+        wf = self.storage.get_workflow_by_name(owner, workflow_name)
+        if not wf:
+            raise Rejected(RejectReason.WORKFLOW_NOT_FOUND, workflow_name)
+        spec = wf.spec
+        if active_run_policy is not None:
+            try:
+                spec.active_run_policy = ActiveRunPolicy(
+                    active_run_policy).value
+            except ValueError:
+                raise Rejected(
+                    RejectReason.INVALID_POLICY,
+                    f"unknown active_run_policy '{active_run_policy}'") from None
+        if retention is not None:
+            spec.retention = retention
+        self._validate_policies(spec)
+        self.storage.update_workflow_spec(wf.id, spec)
+        self._spec_cache[wf.id] = spec
+        logger.info("policies updated: workflow=%s policy=%s retention=%s",
+                    workflow_name, spec.active_run_policy, spec.retention)
+        return wf
+
+    @staticmethod
+    def _validate_policies(spec: WorkflowSpec) -> None:
+        try:
+            ActiveRunPolicy(spec.active_run_policy)
+        except ValueError:
+            raise Rejected(
+                RejectReason.INVALID_POLICY,
+                f"unknown active_run_policy '{spec.active_run_policy}'") \
+                from None
+        r = spec.retention
+        if r.keep_last is not None and r.keep_last < 1:
+            raise Rejected(RejectReason.INVALID_RETENTION,
+                           "keep_last must be >= 1")
+        if r.keep_seconds is not None and r.keep_seconds <= 0:
+            raise Rejected(RejectReason.INVALID_RETENTION,
+                           "keep_seconds must be > 0")
 
     # ---- 触发 ----
     def trigger(self, owner: str, workflow_name: str,
                 idempotency_key: str | None = None,
-                trigger: str = "manual") -> Run:
+                trigger: str = "manual") -> TriggerResult:
         wf = self.storage.get_workflow_by_name(owner, workflow_name)
         if not wf:
             raise Rejected(RejectReason.WORKFLOW_NOT_FOUND, workflow_name)
+        # 1) 有业务去重键：沿用历史幂等语义（唯一索引兜底，并发安全）
         if idempotency_key:
             existing = self.storage.find_run_by_key(wf.id, idempotency_key)
             if existing:
-                self.storage.log_event(
-                    existing.id, None, EV_RUN_DEDUPED,
+                self._log_convergence(
+                    wf, existing,
                     f"duplicate trigger key='{idempotency_key}' "
                     f"policy={self.settings.duplicate_run_policy}")
                 if self.settings.duplicate_run_policy == "reject":
                     raise Rejected(RejectReason.DUPLICATE_RUN, idempotency_key)
-                return existing
+                return TriggerResult(existing, TriggerOutcome.REUSED_KEY,
+                                     f"idempotency_key={idempotency_key}")
+        # 2) 无键（或键未命中）：按工作流自己的活跃收敛策略处理
+        policy = self._active_policy(wf)
+        if policy is not ActiveRunPolicy.ALLOW:
+            active = self.storage.find_active_run(wf.id)
+            if active:
+                scope = {"policy": policy.value, "workflow": wf.name,
+                         "active_run_id": active.id,
+                         "active_status": active.status.value,
+                         "incoming_trigger": trigger,
+                         "active_trigger": active.trigger}
+                if policy is ActiveRunPolicy.REJECT:
+                    msg = (f"active run {active.id} ({active.status.value},"
+                           f" trigger={active.trigger}) already in progress; "
+                           f"incoming trigger={trigger} rejected")
+                    self.storage.add_audit(
+                        AUDIT_TRIGGER_REJECTED, msg, scope,
+                        owner=owner, workflow_id=wf.id)
+                    self.storage.log_event(
+                        active.id, None, EV_RUN_REJECTED,
+                        f"incoming {trigger} trigger rejected by "
+                        f"active_run_policy=reject")
+                    logger.info("trigger rejected: workflow=%s active=%s",
+                                wf.name, active.id)
+                    raise Rejected(RejectReason.ACTIVE_RUN_EXISTS,
+                                   f"active run {active.id} already exists")
+                msg = (f"reused active run {active.id} for incoming "
+                       f"trigger={trigger}; active trigger={active.trigger}")
+                self.storage.add_audit(
+                    AUDIT_TRIGGER_REUSED, msg, scope,
+                    owner=owner, workflow_id=wf.id)
+                self.storage.log_event(
+                    active.id, None, EV_RUN_REUSED,
+                    f"incoming {trigger} trigger merged into active run "
+                    f"by active_run_policy=reuse")
+                logger.info("trigger reused active run: workflow=%s run=%s",
+                            wf.name, active.id)
+                return TriggerResult(active, TriggerOutcome.REUSED_ACTIVE,
+                                     f"active_run_id={active.id}")
+        # 3) 全局积压上限（所有工作流合计）
         if self.storage.count_active_runs() >= self.settings.max_pending_runs:
             self.storage.log_event(
                 None, None, EV_RUN_REJECTED,
@@ -148,28 +244,77 @@ class Orchestrator:
                          next_retry_at=None, error=None,
                          started_at=None, finished_at=None)
                  for t in wf.spec.tasks]
-        try:
-            self.storage.create_run(run, tasks)
-        except sqlite3.IntegrityError:
-            # 并发下同键触发：唯一索引兜底，重新读取已有运行并按策略处理
-            if idempotency_key:
-                existing = self.storage.find_run_by_key(wf.id, idempotency_key)
-                if existing:
-                    self.storage.log_event(
-                        existing.id, None, EV_RUN_DEDUPED,
-                        f"concurrent duplicate key='{idempotency_key}' "
-                        f"policy={self.settings.duplicate_run_policy}")
-                    if self.settings.duplicate_run_policy == "reject":
-                        raise Rejected(RejectReason.DUPLICATE_RUN,
-                                       idempotency_key) from None
-                    return existing
-            raise
+        if policy is ActiveRunPolicy.ALLOW:
+            try:
+                self.storage.create_run(run, tasks)
+            except sqlite3.IntegrityError:
+                # 并发下同键触发：唯一索引兜底，重新读取已有运行并按策略处理
+                if idempotency_key:
+                    existing = self.storage.find_run_by_key(wf.id,
+                                                            idempotency_key)
+                    if existing:
+                        self.storage.log_event(
+                            existing.id, None, EV_RUN_DEDUPED,
+                            f"concurrent duplicate key='{idempotency_key}' "
+                            f"policy={self.settings.duplicate_run_policy}")
+                        if self.settings.duplicate_run_policy == "reject":
+                            raise Rejected(RejectReason.DUPLICATE_RUN,
+                                           idempotency_key) from None
+                        return TriggerResult(
+                            existing, TriggerOutcome.REUSED_KEY,
+                            f"idempotency_key={idempotency_key}")
+                raise
+        else:
+            # 收敛策略下：检查-创建在同一事务，并发窗口里只有一条能创建成功
+            created, active = self.storage.create_run_if_no_active(run, tasks)
+            if not created:
+                if policy is ActiveRunPolicy.REJECT:
+                    self.storage.add_audit(
+                        AUDIT_TRIGGER_REJECTED,
+                        f"concurrent trigger lost the race; active run "
+                        f"{active.id}",
+                        {"policy": policy.value, "workflow": wf.name,
+                         "active_run_id": active.id,
+                         "incoming_trigger": trigger},
+                        owner=owner, workflow_id=wf.id)
+                    raise Rejected(RejectReason.ACTIVE_RUN_EXISTS,
+                                   f"active run {active.id} already exists")
+                self.storage.add_audit(
+                    AUDIT_TRIGGER_REUSED,
+                    f"concurrent trigger merged into active run {active.id}",
+                    {"policy": policy.value, "workflow": wf.name,
+                     "active_run_id": active.id,
+                     "incoming_trigger": trigger},
+                    owner=owner, workflow_id=wf.id)
+                self.storage.log_event(
+                    active.id, None, EV_RUN_REUSED,
+                    f"concurrent {trigger} trigger merged by "
+                    f"active_run_policy=reuse (race window)")
+                return TriggerResult(active, TriggerOutcome.REUSED_ACTIVE,
+                                     f"active_run_id={active.id}")
         self._spec_cache[wf.id] = wf.spec
         self.storage.log_event(run.id, None, EV_RUN_CREATED,
-                               f"trigger={trigger} key={idempotency_key}")
-        logger.info("run created: %s workflow=%s trigger=%s",
-                    run.id, workflow_name, trigger)
-        return run
+                               f"trigger={trigger} key={idempotency_key} "
+                               f"active_run_policy={policy.value}")
+        logger.info("run created: %s workflow=%s trigger=%s policy=%s",
+                    run.id, workflow_name, trigger, policy.value)
+        return TriggerResult(run, TriggerOutcome.CREATED)
+
+    @staticmethod
+    def _active_policy(wf: Workflow) -> ActiveRunPolicy:
+        try:
+            return ActiveRunPolicy(wf.spec.active_run_policy)
+        except ValueError:
+            return ActiveRunPolicy.ALLOW
+
+    def _log_convergence(self, wf: Workflow, existing: Run,
+                         message: str) -> None:
+        self.storage.log_event(existing.id, None, EV_RUN_DEDUPED, message)
+        self.storage.add_audit(
+            AUDIT_TRIGGER_REUSED, message,
+            {"policy": self.settings.duplicate_run_policy,
+             "workflow": wf.name, "reused_run_id": existing.id},
+            owner=existing.owner, workflow_id=wf.id)
 
     def cancel(self, owner: str, run_id: str) -> Run:
         run = self._get_owned_run(owner, run_id)
@@ -192,11 +337,26 @@ class Orchestrator:
     def _get_owned_run(self, owner: str, run_id: str) -> Run:
         run = self.storage.get_run(run_id)
         if not run:
-            raise Rejected(RejectReason.RUN_NOT_FOUND, run_id)
+            self._raise_absent(owner, run_id)
         if run.owner != owner:
+            # 越权在核心层保留可区分的 FORBIDDEN（供本地诊断/日志），
+            # API 层将其映射为 404，绝不通过响应差异泄露对方资源是否存在
             raise Rejected(RejectReason.FORBIDDEN,
                            "run belongs to another owner")
         return run
+
+    def _raise_absent(self, owner: str, run_id: str) -> None:
+        """运行实体不存在时：区分"被保留策略清理"与"从未存在"。
+
+        仅当墓碑属于当前 owner 时才告知 RUN_REAPED；他人墓碑等同不存在。
+        """
+        tomb = self.storage.get_tombstone(run_id)
+        if tomb and tomb["owner"] == owner:
+            raise Rejected(
+                RejectReason.RUN_REAPED,
+                f"run {run_id} was reaped by retention policy "
+                f"at {tomb['reaped_at']:.3f} (reason={tomb['reason']})")
+        raise Rejected(RejectReason.RUN_NOT_FOUND, run_id)
 
     def get_run_view(self, owner: str, run_id: str) -> dict:
         run = self._get_owned_run(owner, run_id)
@@ -206,6 +366,17 @@ class Orchestrator:
     def get_run_events(self, owner: str, run_id: str) -> list[dict]:
         self._get_owned_run(owner, run_id)
         return self.storage.list_events(run_id)
+
+    def list_audit(self, owner: str, workflow_name: str | None = None
+                   ) -> list[dict]:
+        """查询本 owner 的收敛/清理审计记录（他人记录不可见）。"""
+        workflow_id = None
+        if workflow_name is not None:
+            wf = self.storage.get_workflow_by_name(owner, workflow_name)
+            if not wf:
+                raise Rejected(RejectReason.WORKFLOW_NOT_FOUND, workflow_name)
+            workflow_id = wf.id
+        return self.storage.list_audit(owner, workflow_id)
 
     # ---- 调度循环 ----
     def start(self) -> None:
@@ -282,6 +453,105 @@ class Orchestrator:
             threading.Thread(target=self._execute, args=(task, run),
                              daemon=True, name=f"orch-run-{task.name}"
                              ).start()
+        self._maybe_cleanup()
+
+    # ---- 历史保留策略 ----
+    def _maybe_cleanup(self) -> None:
+        """后台节流清理：到点且当前没有清理在跑时才尝试，绝不阻塞触发/查询。"""
+        if not self.settings.retention_enabled:
+            return
+        if self._cleaning.is_set():
+            return
+        if now() - self._last_cleanup < self.settings.cleanup_interval_seconds:
+            return
+        self._last_cleanup = now()
+        self._cleaning.set()
+        threading.Thread(target=self._cleanup_safe, daemon=True,
+                         name="orch-retention").start()
+
+    def _cleanup_safe(self) -> None:
+        try:
+            self.enforce_all_retention()
+            self._prune_bookkeeping()
+        except Exception:
+            logger.exception("retention cleanup failed")
+        finally:
+            self._cleaning.clear()
+
+    def enforce_all_retention(self, limit_workflows: int | None = None
+                              ) -> dict[str, int]:
+        """按每条工作流各自的策略清理已结束运行，返回 {workflow_id: 清理条数}。"""
+        report: dict[str, int] = {}
+        for wf in self.storage.list_all_workflows()[:limit_workflows]:
+            n = self.enforce_retention(wf)
+            if n:
+                report[wf.id] = n
+        return report
+
+    def enforce_retention(self, wf: Workflow) -> int:
+        """清理单条工作流超出保留范围的历史；不满足策略或无候选时返回 0。
+
+        - 只选已结束（终态）运行，PENDING/RUNNING 绝不触碰；
+        - 数量与时间条件取交集，超出范围的整批在一个事务内删除；
+        - 每条删除连 task_runs/events 一起清，并写墓碑与审计；
+        - 单批最多 cleanup_batch_runs 条，控制锁持有时间，不卡触发与查询。
+        """
+        r = wf.spec.retention
+        if r.keep_last is None and r.keep_seconds is None:
+            return 0
+        terminal = self.storage.list_terminal_runs(wf.id)
+        victims: list[Run] = []
+        age_cutoff = now() - r.keep_seconds if r.keep_seconds else None
+        for idx, run in enumerate(terminal):  # 已按结束时间倒序
+            too_many = r.keep_last is not None and idx >= r.keep_last
+            too_old = (age_cutoff is not None
+                       and run.updated_at < age_cutoff)
+            if too_many or too_old:
+                victims.append(run)
+        victims = victims[:self.settings.cleanup_batch_runs]
+        if not victims:
+            return 0
+        ids = [v.id for v in victims]
+        marks = self.storage.reap_runs(ids, reason=self._retention_reason(r))
+        scope = {
+            "workflow": wf.name, "keep_last": r.keep_last,
+            "keep_seconds": r.keep_seconds,
+            "reaped_count": len(marks),
+            "reaped_run_ids": [m["run_id"] for m in marks][:100],
+            "oldest_finished_at": min(m["finished_at"] for m in marks),
+            "newest_finished_at": max(m["finished_at"] for m in marks),
+            "truncated": len(ids) >= self.settings.cleanup_batch_runs,
+        }
+        self.storage.add_audit(
+            AUDIT_RETENTION_REAPED,
+            f"reaped {len(marks)} finished run(s) of '{wf.name}' by "
+            f"retention keep_last={r.keep_last} keep_seconds={r.keep_seconds}",
+            scope, owner=wf.owner, workflow_id=wf.id)
+        logger.info("retention reaped %d runs of workflow=%s",
+                    len(marks), wf.name)
+        return len(marks)
+
+    @staticmethod
+    def _retention_reason(r: RetentionPolicy) -> str:
+        if r.keep_last is not None and r.keep_seconds is not None:
+            return f"keep_last={r.keep_last}|keep_seconds={r.keep_seconds}"
+        if r.keep_last is not None:
+            return f"keep_last={r.keep_last}"
+        return f"keep_seconds={r.keep_seconds}"
+
+    def _prune_bookkeeping(self) -> None:
+        """墓碑与审计自身也必须有界：按 TTL（审计另加行数硬上界）裁剪。"""
+        tombs = self.storage.prune_tombstones(
+            self.settings.tombstone_ttl_seconds)
+        rows = self.storage.prune_audit(self.settings.audit_ttl_seconds,
+                                        self.settings.audit_max_rows)
+        if tombs or rows:
+            self.storage.add_audit(
+                AUDIT_AUDIT_PRUNED,
+                f"pruned {tombs} tombstone(s), {rows} audit row(s)",
+                {"tombstones": tombs, "audit_rows": rows})
+            logger.info("bookkeeping pruned: tombstones=%d audit=%d",
+                        tombs, rows)
 
     # ---- 运行推进 ----
     def _spec_for(self, run: Run) -> WorkflowSpec:
@@ -408,15 +678,18 @@ class Orchestrator:
             if last is not None and now() - last < interval:
                 continue
             try:
-                self.trigger(wf.owner, wf.name, idempotency_key=key,
-                             trigger="schedule")
+                # 与手动触发走完全相同的入口：键去重 + 活跃收敛策略
+                result = self.trigger(wf.owner, wf.name,
+                                      idempotency_key=key,
+                                      trigger="schedule")
+                logger.debug("scheduled tick of %s -> %s (%s)",
+                             wf.name, result.run.id, result.outcome.value)
                 self._sched_last[wf.id] = now()
             except Rejected as e:
-                if e.reason == RejectReason.DUPLICATE_RUN:
-                    self._sched_last[wf.id] = now()  # 本槽位已触发过
-                else:  # 积压等：按策略跳过本槽位，下周期再试
-                    self.storage.log_event(
-                        None, None, EV_RUN_REJECTED,
-                        f"scheduled trigger of '{wf.name}' skipped: "
-                        f"{e.reason.value}")
-                    self._sched_last[wf.id] = now()
+                # 本槽位已触发过 / 被活跃收敛拒绝 / 积压：跳过本槽位，
+                # 具体原因已由 trigger() 写入审计与事件
+                self.storage.log_event(
+                    None, None, EV_RUN_REJECTED,
+                    f"scheduled trigger of '{wf.name}' skipped: "
+                    f"{e.reason.value}")
+                self._sched_last[wf.id] = now()

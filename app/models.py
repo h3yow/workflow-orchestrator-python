@@ -87,11 +87,22 @@ class RejectReason(str, enum.Enum):
     DEPENDENCY_CYCLE = "DEPENDENCY_CYCLE"        # 依赖成环
     DUPLICATE_WORKFLOW = "DUPLICATE_WORKFLOW"    # 同名工作流已存在
     DUPLICATE_RUN = "DUPLICATE_RUN"              # 幂等键冲突且策略为拒绝
+    ACTIVE_RUN_EXISTS = "ACTIVE_RUN_EXISTS"      # 已有活跃运行且收敛策略为拒绝
     QUEUE_FULL = "QUEUE_FULL"                    # 运行积压超过上限
     WORKFLOW_NOT_FOUND = "WORKFLOW_NOT_FOUND"
     RUN_NOT_FOUND = "RUN_NOT_FOUND"
+    RUN_REAPED = "RUN_REAPED"                    # 运行曾存在，已被保留策略清理
     FORBIDDEN = "FORBIDDEN"                      # 越权访问
     RUN_NOT_ACTIVE = "RUN_NOT_ACTIVE"            # 运行已结束，无法取消等操作
+    INVALID_RETENTION = "INVALID_RETENTION"      # 保留策略参数非法
+    INVALID_POLICY = "INVALID_POLICY"            # 并发收敛策略参数非法
+
+
+# 触发收敛结果（无业务去重键时也能区分"新建"与"复用"）
+class TriggerOutcome(str, enum.Enum):
+    CREATED = "CREATED"        # 新建了一条运行
+    REUSED_KEY = "REUSED_KEY"  # 命中幂等键，复用已有运行
+    REUSED_ACTIVE = "REUSED_ACTIVE"  # 无新键，按活跃收敛策略复用了活跃运行
 
 
 class Rejected(Exception):
@@ -113,12 +124,38 @@ class TaskSpec:
     timeout_seconds: float | None = None  # 单次执行超时
 
 
+class ActiveRunPolicy(str, enum.Enum):
+    """同一条工作流在无业务去重键（或键未命中）时的并发收敛策略。
+
+    ALLOW：不做活跃收敛（保持历史语义，允许并发多条活跃运行）；
+    REUSE：已有活跃运行时复用它，绝不新建第二条；
+    REJECT：已有活跃运行时明确拒绝（ACTIVE_RUN_EXISTS）。
+    """
+    ALLOW = "allow"
+    REUSE = "reuse"
+    REJECT = "reject"
+
+
+@dataclass
+class RetentionPolicy:
+    """每条工作流各自的已结束运行历史保留策略。
+
+    keep_last：只保留最近 N 条已结束运行（None 表示不按数量裁剪）；
+    keep_seconds：只保留最近 N 秒内结束的运行（None 表示不按时间裁剪）。
+    两者同时设置时取交集：只有"既在最近 N 条内、又未超龄"的运行被保留。
+    """
+    keep_last: int | None = None
+    keep_seconds: float | None = None
+
+
 @dataclass
 class WorkflowSpec:
     name: str
     owner: str
     tasks: list[TaskSpec]
     schedule_interval_seconds: float | None = None  # 定时触发间隔，None 表示仅手动
+    active_run_policy: str = ActiveRunPolicy.ALLOW.value  # 活跃运行并发收敛策略
+    retention: RetentionPolicy = field(default_factory=RetentionPolicy)
 
 
 @dataclass
@@ -140,6 +177,19 @@ class Run:
     idempotency_key: str | None
     created_at: float
     updated_at: float
+
+
+@dataclass
+class TriggerResult:
+    """触发结果：Run 本体 + 本次判定（新建/复用），便于调用方区分。"""
+    run: Run
+    outcome: TriggerOutcome
+    detail: str = ""
+
+    # 便捷访问器：历史代码直接用 trigger(...).id 仍可用
+    @property
+    def id(self) -> str:
+        return self.run.id
 
 
 @dataclass

@@ -14,7 +14,10 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .executor import Executor, HandlerRegistry
-from .models import Rejected, RejectReason, WorkflowSpec, TaskSpec
+from .models import (
+    ActiveRunPolicy, Rejected, RejectReason, RetentionPolicy,
+    WorkflowSpec, TaskSpec,
+)
 from .scheduler import Orchestrator
 from .storage import Storage
 
@@ -28,17 +31,35 @@ class TaskSpecIn(BaseModel):
     timeout_seconds: float | None = None
 
 
+class RetentionIn(BaseModel):
+    keep_last: int | None = Field(default=None, ge=1)
+    keep_seconds: float | None = Field(default=None, gt=0)
+
+
 class WorkflowIn(BaseModel):
     name: str
     tasks: list[TaskSpecIn]
     schedule_interval_seconds: float | None = None
+    active_run_policy: str = ActiveRunPolicy.ALLOW.value
+    retention: RetentionIn = Field(default_factory=RetentionIn)
 
 
 class TriggerIn(BaseModel):
     idempotency_key: str | None = None
 
 
+class PolicyIn(BaseModel):
+    active_run_policy: str | None = None
+    retention: RetentionIn | None = None
+
+
 def _jsonable(obj):
+    from .models import TriggerResult
+    if isinstance(obj, TriggerResult):
+        body = _jsonable(obj.run)
+        body["outcome"] = obj.outcome.value
+        body["detail"] = obj.detail
+        return body
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return {k: _jsonable(v) for k, v in dataclasses.asdict(obj).items()}
     if isinstance(obj, enum.Enum):
@@ -54,10 +75,14 @@ _STATUS = {
     RejectReason.WORKFLOW_NOT_FOUND: 404,
     RejectReason.RUN_NOT_FOUND: 404,
     RejectReason.FORBIDDEN: 404,  # 不泄露他人资源的存在性
+    RejectReason.RUN_REAPED: 410,  # 曾存在但被保留策略清理（仅本 owner 可见）
     RejectReason.UNKNOWN_TASK: 422,
     RejectReason.DEPENDENCY_CYCLE: 422,
     RejectReason.DUPLICATE_WORKFLOW: 409,
     RejectReason.DUPLICATE_RUN: 409,
+    RejectReason.ACTIVE_RUN_EXISTS: 409,
+    RejectReason.INVALID_POLICY: 422,
+    RejectReason.INVALID_RETENTION: 422,
     RejectReason.QUEUE_FULL: 429,
     RejectReason.RUN_NOT_ACTIVE: 409,
 }
@@ -93,9 +118,17 @@ def create_app(settings: Settings | None = None,
     @app.exception_handler(Rejected)
     def _rejected(_, exc: Rejected):
         from fastapi.responses import JSONResponse
+        status = _STATUS.get(exc.reason, 400)
+        error = exc.reason.value
+        detail = exc.detail
+        if exc.reason in (RejectReason.RUN_NOT_FOUND, RejectReason.FORBIDDEN):
+            # 运行级 404（不存在/越权访问他人资源/越权探测他人墓碑）给出完全
+            # 一致的固定响应体，不回显 run_id 等任何输入，杜绝存在性侧信道。
+            # 注意：RUN_REAPED 是 410，只会返回给资源真正的 owner。
+            error = RejectReason.RUN_NOT_FOUND.value
+            detail = "run not found"
         return JSONResponse(
-            status_code=_STATUS.get(exc.reason, 400),
-            content={"error": exc.reason.value, "detail": exc.detail})
+            status_code=status, content={"error": error, "detail": detail})
 
     @app.post("/workflows", status_code=201)
     def register(body: WorkflowIn, x_owner_id: str | None = Header(None)):
@@ -103,7 +136,9 @@ def create_app(settings: Settings | None = None,
         spec = WorkflowSpec(
             name=body.name, owner=owner,
             tasks=[TaskSpec(**t.model_dump()) for t in body.tasks],
-            schedule_interval_seconds=body.schedule_interval_seconds)
+            schedule_interval_seconds=body.schedule_interval_seconds,
+            active_run_policy=body.active_run_policy,
+            retention=RetentionPolicy(**body.retention.model_dump()))
         wf = orchestrator.register_workflow(spec)
         return _jsonable(wf)
 
@@ -112,6 +147,34 @@ def create_app(settings: Settings | None = None,
         owner = owner_of(x_owner_id)
         return [_jsonable(w) for w in
                 orchestrator.storage.list_workflows(owner)]
+
+    @app.put("/workflows/{name}/policies")
+    def update_policies(name: str, body: PolicyIn,
+                        x_owner_id: str | None = Header(None)):
+        owner = owner_of(x_owner_id)
+        retention = (RetentionPolicy(**body.retention.model_dump())
+                     if body.retention is not None else None)
+        wf = orchestrator.update_policies(
+            owner, name, active_run_policy=body.active_run_policy,
+            retention=retention)
+        return _jsonable(wf)
+
+    @app.post("/workflows/{name}/retention:enforce")
+    def enforce_retention(name: str,
+                          x_owner_id: str | None = Header(None)):
+        """立即按该工作流的保留策略执行一次清理（后台周期清理之外的手动入口）。"""
+        owner = owner_of(x_owner_id)
+        wf = orchestrator.storage.get_workflow_by_name(owner, name)
+        if not wf:
+            raise Rejected(RejectReason.WORKFLOW_NOT_FOUND, name)
+        reaped = orchestrator.enforce_retention(wf)
+        return {"workflow": name, "reaped": reaped}
+
+    @app.get("/audit")
+    def list_audit(workflow: str | None = None,
+                   x_owner_id: str | None = Header(None)):
+        owner = owner_of(x_owner_id)
+        return orchestrator.list_audit(owner, workflow)
 
     @app.post("/workflows/{name}/runs", status_code=201)
     def trigger(name: str, body: TriggerIn | None = None,
