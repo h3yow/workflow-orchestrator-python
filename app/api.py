@@ -32,10 +32,22 @@ class WorkflowIn(BaseModel):
     name: str
     tasks: list[TaskSpecIn]
     schedule_interval_seconds: float | None = None
+    # 并发收敛：allow（默认，可并行）| reuse（复用活跃运行）| reject（拒绝）
+    active_run_policy: str = "allow"
+    # 历史保留：仅对已结束运行生效；None 表示该维度不限制
+    retain_last_runs: int | None = None
+    retain_seconds: float | None = None
+    tombstone_limit: int = 100
 
 
 class TriggerIn(BaseModel):
     idempotency_key: str | None = None
+
+
+class RetentionIn(BaseModel):
+    retain_last_runs: int | None = None
+    retain_seconds: float | None = None
+    tombstone_limit: int | None = None
 
 
 def _jsonable(obj):
@@ -56,10 +68,13 @@ _STATUS = {
     RejectReason.FORBIDDEN: 404,  # 不泄露他人资源的存在性
     RejectReason.UNKNOWN_TASK: 422,
     RejectReason.DEPENDENCY_CYCLE: 422,
+    RejectReason.INVALID_POLICY: 422,
     RejectReason.DUPLICATE_WORKFLOW: 409,
     RejectReason.DUPLICATE_RUN: 409,
+    RejectReason.ACTIVE_RUN_CONFLICT: 409,
     RejectReason.QUEUE_FULL: 429,
     RejectReason.RUN_NOT_ACTIVE: 409,
+    RejectReason.RUN_PURGED: 410,  # 资源曾存在但已被保留策略清理
 }
 
 
@@ -93,9 +108,11 @@ def create_app(settings: Settings | None = None,
     @app.exception_handler(Rejected)
     def _rejected(_, exc: Rejected):
         from fastapi.responses import JSONResponse
+        body = {"error": exc.reason.value, "detail": exc.detail}
+        if exc.extra:
+            body.update(exc.extra)  # 机器可读补充（如 active_run_id）
         return JSONResponse(
-            status_code=_STATUS.get(exc.reason, 400),
-            content={"error": exc.reason.value, "detail": exc.detail})
+            status_code=_STATUS.get(exc.reason, 400), content=body)
 
     @app.post("/workflows", status_code=201)
     def register(body: WorkflowIn, x_owner_id: str | None = Header(None)):
@@ -103,7 +120,11 @@ def create_app(settings: Settings | None = None,
         spec = WorkflowSpec(
             name=body.name, owner=owner,
             tasks=[TaskSpec(**t.model_dump()) for t in body.tasks],
-            schedule_interval_seconds=body.schedule_interval_seconds)
+            schedule_interval_seconds=body.schedule_interval_seconds,
+            active_run_policy=body.active_run_policy,
+            retain_last_runs=body.retain_last_runs,
+            retain_seconds=body.retain_seconds,
+            tombstone_limit=body.tombstone_limit)
         wf = orchestrator.register_workflow(spec)
         return _jsonable(wf)
 
@@ -113,17 +134,46 @@ def create_app(settings: Settings | None = None,
         return [_jsonable(w) for w in
                 orchestrator.storage.list_workflows(owner)]
 
-    @app.post("/workflows/{name}/runs", status_code=201)
+    @app.put("/workflows/{name}/retention")
+    def update_retention(name: str, body: RetentionIn,
+                          x_owner_id: str | None = Header(None)):
+        owner = owner_of(x_owner_id)
+        wf = orchestrator.update_retention_policy(
+            owner, name, body.retain_last_runs, body.retain_seconds,
+            body.tombstone_limit)
+        return _jsonable(wf)
+
+    @app.post("/workflows/{name}/runs")
     def trigger(name: str, body: TriggerIn | None = None,
                 x_owner_id: str | None = Header(None)):
         owner = owner_of(x_owner_id)
         key = body.idempotency_key if body else None
-        return _jsonable(orchestrator.trigger(owner, name, key))
+        outcome = orchestrator.trigger_detailed(owner, name, key)
+        # 复用已有的运行返回 200；新建返回 201，便于调用方区分
+        from fastapi.responses import JSONResponse
+        payload = _jsonable(outcome.run)
+        payload["trigger_outcome"] = outcome.outcome
+        payload["convergence_reason"] = outcome.reason
+        payload["idempotency_hit"] = outcome.idempotency_hit
+        status = 201 if outcome.outcome == "created" else 200
+        return JSONResponse(status_code=status, content=payload)
 
     @app.get("/runs")
     def list_runs(x_owner_id: str | None = Header(None)):
         owner = owner_of(x_owner_id)
         return [_jsonable(r) for r in orchestrator.storage.list_runs(owner)]
+
+    @app.get("/runs/purged")
+    def list_purged(x_owner_id: str | None = Header(None)):
+        """本调用方被保留策略清理的运行墓碑（区分于从未存在）。"""
+        owner = owner_of(x_owner_id)
+        return orchestrator.list_tombstones(owner)
+
+    @app.get("/audit")
+    def list_audit(limit: int = 200, x_owner_id: str | None = Header(None)):
+        """本调用方的收敛/拒绝/清理可解释记录（有界，按时间倒序）。"""
+        owner = owner_of(x_owner_id)
+        return orchestrator.list_audit(owner, min(max(limit, 1), 1000))
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str, x_owner_id: str | None = Header(None)):

@@ -92,14 +92,27 @@ class RejectReason(str, enum.Enum):
     RUN_NOT_FOUND = "RUN_NOT_FOUND"
     FORBIDDEN = "FORBIDDEN"                      # 越权访问
     RUN_NOT_ACTIVE = "RUN_NOT_ACTIVE"            # 运行已结束，无法取消等操作
+    ACTIVE_RUN_CONFLICT = "ACTIVE_RUN_CONFLICT"  # 已有活跃运行且策略为 reject
+    RUN_PURGED = "RUN_PURGED"                    # 运行曾存在，但已被保留策略清理
+    INVALID_POLICY = "INVALID_POLICY"            # 并发/保留策略参数非法
+
+
+# 并发收敛策略：同一工作流同一时刻的活跃运行数
+ACTIVE_POLICY_ALLOW = "allow"    # 不收敛（历史默认语义，受积压上限约束）
+ACTIVE_POLICY_REUSE = "reuse"    # 复用已有活跃运行
+ACTIVE_POLICY_REJECT = "reject"  # 拒绝后来的触发
+ACTIVE_POLICIES = {ACTIVE_POLICY_ALLOW, ACTIVE_POLICY_REUSE,
+                   ACTIVE_POLICY_REJECT}
 
 
 class Rejected(Exception):
     """请求被拒绝，携带可区分分的原因。"""
 
-    def __init__(self, reason: RejectReason, detail: str = ""):
+    def __init__(self, reason: RejectReason, detail: str = "",
+                 extra: dict | None = None):
         self.reason = reason
         self.detail = detail
+        self.extra = extra or {}
         super().__init__(f"{reason.value}: {detail}")
 
 
@@ -119,6 +132,14 @@ class WorkflowSpec:
     owner: str
     tasks: list[TaskSpec]
     schedule_interval_seconds: float | None = None  # 定时触发间隔，None 表示仅手动
+    # 并发收敛策略：同一时刻是否允许多条活跃运行
+    # "allow"(不收敛，历史默认) | "reuse"(复用活跃运行) | "reject"(拒绝)
+    active_run_policy: str = "allow"
+    # 历史保留策略（仅针对已结束运行）；None 表示该维度不限制
+    retain_last_runs: int | None = None   # 仅保留最近 N 条已结束运行
+    retain_seconds: float | None = None  # 仅保留最近 N 秒内结束的运行
+    # 因保留策略被清理的运行墓碑上限（自身有界，防止清理记录无限增长）
+    tombstone_limit: int = 100
 
 
 @dataclass
@@ -154,3 +175,17 @@ class TaskRun:
     error: str | None
     started_at: float | None
     finished_at: float | None
+
+
+# 触发收敛结果
+TRIGGER_CREATED = "created"    # 新运行已创建
+TRIGGER_REUSED = "reused"    # 复用了已有的活跃运行（无键或幂等键命中）
+
+
+@dataclass
+class TriggerOutcome:
+    """触发请求的可解释结果：新建 / 复用，复用携带被复用的运行与原因。"""
+    run: Run
+    outcome: str            # TRIGGER_CREATED | TRIGGER_REUSED
+    reason: str             # 人类可读的收敛/去重依据
+    idempotency_hit: bool = False  # 是否因幂等键命中而复用

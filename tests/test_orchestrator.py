@@ -302,6 +302,16 @@ def test_scheduled_trigger_fires_and_dedups(make_orch):
             break
         time.sleep(0.02)
     time.sleep(0.1)
+    # 停止调度前，等待已触发的定时运行全部进入终态，避免与 tick 的时序竞态
+    settle = time.time() + 5
+    while time.time() < settle:
+        runs = [r for r in orch.storage.list_runs("o")
+                if r.trigger == "schedule"]
+        if runs and all(r.status in (RunStatus.SUCCEEDED, RunStatus.FAILED,
+                                      RunStatus.CANCELLED)
+                          for r in runs):
+            break
+        time.sleep(0.01)
     orch.stop()
     runs = [r for r in orch.storage.list_runs("o") if r.trigger == "schedule"]
     explain(f"输入: 间隔 0.05s 的定时工作流运行 0.3s; "
