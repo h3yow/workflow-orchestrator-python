@@ -1,8 +1,11 @@
 """FastAPI HTTP 入口。
 
-隔离边界：调用方必须携带 X-Owner-Id 头；所有读写按 owner 过滤，
-访问他人资源一律返回 404（不泄露存在性），非法请求返回 409/422 并
-携带可区分的原因码。
+隔离边界：调用方必须携带 X-Owner-Id 头；所有读写按 owner 过滤。
+按运行进入的入口（详情/执行历史/取消）对“他人存活运行 / 他人已被清理
+运行 / 根本不存在”返回**完全一致**的 404 响应（错误码、响应体逐字节
+相同，不回显 id、不携带对方状态/清理时间等任何信息）；只有本人查询
+自己被保留策略清理的运行才返回 410 RUN_PURGED。非法请求返回
+409/422 并携带可区分的原因码。
 """
 from __future__ import annotations
 
@@ -62,10 +65,19 @@ def _jsonable(obj):
     return obj
 
 
+# 按运行进入的入口（详情/执行历史/取消）在“越权 / 对方运行已被清理 /
+# 根本不存在”三种情况下必须返回字节级一致的响应：相同状态码、相同错误码、
+# 相同响应体，且不回显 run_id、不带任何 extra，避免枚举 id 推断存在性。
+_RUN_HIDDEN_STATUS = 404
+_RUN_HIDDEN_BODY = {"error": RejectReason.RUN_NOT_FOUND.value,
+                    "detail": "run not found"}
+# 内部用 FORBIDDEN 表达“命中了他人资源”，仅服务端可辨，HTTP 边界归一隐藏
+_RUN_HIDDEN_REASONS = {RejectReason.FORBIDDEN, RejectReason.RUN_NOT_FOUND}
+
 _STATUS = {
     RejectReason.WORKFLOW_NOT_FOUND: 404,
-    RejectReason.RUN_NOT_FOUND: 404,
-    RejectReason.FORBIDDEN: 404,  # 不泄露他人资源的存在性
+    RejectReason.RUN_NOT_FOUND: _RUN_HIDDEN_STATUS,
+    RejectReason.FORBIDDEN: _RUN_HIDDEN_STATUS,  # 不泄露他人资源的存在性
     RejectReason.UNKNOWN_TASK: 422,
     RejectReason.DEPENDENCY_CYCLE: 422,
     RejectReason.INVALID_POLICY: 422,
@@ -108,6 +120,11 @@ def create_app(settings: Settings | None = None,
     @app.exception_handler(Rejected)
     def _rejected(_, exc: Rejected):
         from fastapi.responses import JSONResponse
+        if exc.reason in _RUN_HIDDEN_REASONS:
+            # 越权 / 不存在 / 他人墓碑：归一为同一个恒定响应，
+            # 丢弃内部 detail（可能含 run_id 或归属信息）与 extra
+            return JSONResponse(status_code=_RUN_HIDDEN_STATUS,
+                                content=_RUN_HIDDEN_BODY)
         body = {"error": exc.reason.value, "detail": exc.detail}
         if exc.extra:
             body.update(exc.extra)  # 机器可读补充（如 active_run_id）

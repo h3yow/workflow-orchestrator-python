@@ -45,6 +45,14 @@ curl -s -X PUT localhost:8000/workflows/demo/retention -H 'X-Owner-Id: alice' \
   -H 'Content-Type: application/json' -d '{"retain_last_runs":2}'
 curl -s localhost:8000/runs/purged -H 'X-Owner-Id: alice'   # 被清理运行的墓碑（410 可查）
 curl -s localhost:8000/audit -H 'X-Owner-Id: alice'        # 复用/拒绝/清理的可解释记录
+
+# 越权不可区分：bob 查 alice 存活运行 / alice 已被清理运行 / 编造的 id，
+# 三个响应必须逐字节一致（均为 404 RUN_NOT_FOUND 恒定体）
+curl -si localhost:8000/runs/<alice_run_id>        -H 'X-Owner-Id: bob'
+curl -si localhost:8000/runs/<alice_purged_run_id> -H 'X-Owner-Id: bob'
+curl -si localhost:8000/runs/does-not-exist        -H 'X-Owner-Id: bob'
+# /runs/<id>/events 与 /runs/<id>/cancel 三个入口同理，可逐个替换路径验证；
+# 对照：alice 自己查被清理的运行 -> 410 RUN_PURGED，自己查编造 id -> 404
 ```
 
 内置处理器：`echo`（回显）、`sleep`（休眠，payload 传 seconds）、
@@ -111,8 +119,22 @@ curl -s localhost:8000/audit -H 'X-Owner-Id: alice'        # 复用/拒绝/清�
 ## 隔离边界
 
 - 调用方以 `X-Owner-Id` 头标识身份（缺失 → 401）。
-- 所有查询按 owner 过滤；访问他人运行/历史一律返回 404（不泄露存在性），
-  取消等写操作同理拒绝。
+- 所有查询按 owner 过滤；**按运行进入的入口**（`GET /runs/{id}`、
+  `GET /runs/{id}/events`、`POST /runs/{id}/cancel`）在以下三种情况下
+  返回**逐字节完全一致**的恒定响应——`404`，body 恒为
+  `{"error":"RUN_NOT_FOUND","detail":"run not found"}`，
+  无法据此枚举 id 反推他人运行是否存在：
+  1. 运行存在但属于他人（无论存活、已结束还是进行中）；
+  2. 运行属于他人但已被保留策略清理（墓碑也是他人的）；
+  3. 运行根本不存在（含墓碑不存在）。
+
+  该响应不回显传入的 run_id，也不携带对方状态、清理时间、清理原因等任何
+  信息（服务端内部仍以 FORBIDDEN 语义区分“命中他人资源”，仅用于自身逻辑，
+  在 HTTP 边界统一归一为上述 404）。取消入口的越权调用同样只返回该 404，
+  且不会对他人运行产生任何副作用。
+- **例外（本人查本人的墓碑）**：本人查询自己被保留策略清理的运行时返回
+  `410 RUN_PURGED`，body 带 `terminal_status`/`purged_at`/`reason`，
+  与本人查“从未存在”的 404 明确可分；本人查自己正常运行的路径不受影响。
 
 ## 历史保留策略（存储有上界）
 
@@ -139,17 +161,29 @@ curl -s localhost:8000/audit -H 'X-Owner-Id: alice'        # 复用/拒绝/清�
 
 ## 清理后的查询语义
 
-对 `GET /runs/{id}`（及其 `/events`、取消等）严格区分三种情况：
+对 `GET /runs/{id}`、`GET /runs/{id}/events`、`POST /runs/{id}/cancel`
+三个按运行进入的入口，严格区分四种情况，且**越权方视角完全不可分辨**：
 
 | 情况 | 返回 |
 | --- | --- |
-| 运行存在且属于自己 | 200，正常返回运行与任务状态 |
-| 运行存在但属于他人 | **404**（与不存在不可区分，不泄露存在性） |
+| 运行存在且属于自己 | 200，正常返回运行与任务状态（取消则正常取消） |
+| 运行存在但属于他人（存活/进行中/已结束） | **404 恒定响应**（见下，不泄露存在性） |
 | 运行不存在，但有**自己的**墓碑（被保留策略清掉了） | **410 `RUN_PURGED`**，body 带 `terminal_status`/`purged_at`/`reason` |
-| 运行不存在、也没有自己的墓碑（含墓碑属于他人） | **404 `RUN_NOT_FOUND`** |
+| 运行不存在且无自己的墓碑（含墓碑属于他人、id 纯属编造） | **404 恒定响应**（与越权完全一致） |
 
-关键点：墓碑同样按 owner 校验——越权查询一条已被清理的他人运行，得到的仍是 404，
-无法据此推断对方是否存在。`GET /runs/purged` 可列出本调用方自己的墓碑。
+越权/不存在的恒定响应为：
+
+```http
+HTTP/1.1 404
+{"error":"RUN_NOT_FOUND","detail":"run not found"}
+```
+
+即“对方有这条运行 / 对方这条运行已被清理 / 根本没有这条运行”对越权方
+完全无法区分：状态码、错误码、响应体字段与值全部相同，不回显请求的 id，
+也不暴露对方状态、被清理时间、清理原因。关键点：墓碑同样按 owner 校验——
+越权查询一条已被清理的他人运行，得到的仍是同一个 404；只有本人查询自己的
+墓碑才得到 410，从而把“我这条被清掉了”和“我压根没有这条”继续区分开。
+`GET /runs/purged` 可列出本调用方自己的墓碑。
 
 ## 可解释且有界的审计
 
@@ -172,9 +206,9 @@ curl -s localhost:8000/audit -H 'X-Owner-Id: alice'        # 复用/拒绝/清�
 | GET | `/runs` | 列出本调用方运行 |
 | GET | `/runs/purged` | 列出本调用方被保留策略清理的运行墓碑 |
 | GET | `/audit` | 本调用方的收敛/拒绝/清理审计记录（有界） |
-| GET | `/runs/{run_id}` | 运行与任务状态（被清理 → 410，越权/不存在 → 404） |
-| GET | `/runs/{run_id}/events` | 执行历史（调度决策/重试/拒绝原因） |
-| POST | `/runs/{run_id}/cancel` | 取消运行 |
+| GET | `/runs/{run_id}` | 运行与任务状态（本人被清理 → 410；越权/不存在 → 同一个恒定 404） |
+| GET | `/runs/{run_id}/events` | 执行历史（调度决策/重试/拒绝原因），隔离语义同上 |
+| POST | `/runs/{run_id}/cancel` | 取消运行（本人已结束 → 409 RUN_NOT_ACTIVE；越权/不存在 → 同一个恒定 404） |
 
 错误响应统一为 `{"error": <原因码>, "detail": ...}`，原因码见
 `app/models.py` 的 `RejectReason`。
@@ -212,5 +246,12 @@ curl -s localhost:8000/audit -H 'X-Owner-Id: alice'        # 复用/拒绝/清�
 - `test_new_features_api.py`：HTTP 层 201/200 收敛响应体、409 冲突带
   active_run_id、410 清理语义与越权 404、保留策略更新 200/非法 422、
   审计接口隔离、非法并发策略注册 422。
+- `test_unauthorized_indistinguishable.py`：越权方对“他人存活运行 /
+  他人已被清理运行 / 随机不存在 id”三种输入，在运行详情、执行历史、取消
+  三个入口上拿到的 9 个响应逐字节完全一致（状态码、错误码、响应体字段与值
+  均为恒定 404 `RUN_NOT_FOUND`，不回显 id、不泄露对方状态/清理时间/原因），
+  且越权取消对他人运行无副作用；另断言本人查自己被清理运行仍是 410
+  `RUN_PURGED`（带终态/时间/原因），与本人查不存在的 404 明确可分，
+  本人正常运行查询仍为 200。
 
 单测日志通过 `[TEST-EXPLAIN]` 打印输入与判定依据。
