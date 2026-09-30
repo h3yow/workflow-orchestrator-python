@@ -75,7 +75,8 @@ def test_cross_owner_query_never_reveals_existence(make_orch):
     purged_id = _terminal_run(orch.storage, wf_a.id, "alice", age=1000)
     orch.enforce_retention(wf_a)
     explain("输入: bob 查询 alice 已清理运行、carol 存活运行、随机不存在 id；"
-            "期望全部 FORBIDDEN(404 语义)")
+            "期望三者返回完全一致的 RUN_NOT_FOUND（不泄露存在性）")
+    seen = []
     for target, label in ((purged_id, "他人-已清理"),
                             (alive_id, "他人-存活"),
                             ("nope", "从未存在")):
@@ -83,10 +84,12 @@ def test_cross_owner_query_never_reveals_existence(make_orch):
             orch.get_run_view("bob", target)
             raise AssertionError(f"{label} 不应读取成功")
         except Rejected as e:
-            explain(f"  {label} -> {e.reason.value}")
-            assert e.reason in (RejectReason.FORBIDDEN,
-                                  RejectReason.RUN_NOT_FOUND)
-            assert e.reason != RejectReason.RUN_PURGED, "越权不得得知已清理"
+            explain(f"  {label} -> reason={e.reason.value} "
+                    f"detail={e.detail!r} extra={e.extra}")
+            seen.append((e.reason, e.detail, e.extra))
+            assert e.reason == RejectReason.RUN_NOT_FOUND
+    # 三种情况的 reason/detail/extra 逐项一致，无任何可区分信息
+    assert all(s == seen[0] for s in seen), f"越权响应可区分: {seen}"
     assert orch.list_tombstones("bob") == []
     assert orch.list_audit("bob") == []
 

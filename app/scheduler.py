@@ -367,20 +367,24 @@ class Orchestrator:
         return self.storage.get_run(run_id)
 
     # ---- 查询（含隔离与清理后语义） ----
-    def _resolve_owned_run(self, owner: str, run_id: str) -> Run:
-        """解析 run 的可见性，三种语义严格区分：
+    # 越权/不存在统一拒绝：reason、detail、extra 全部固定，
+    # 不夹带 run_id、归属、状态、清理时间等任何可区分信息，
+    # 保证"他人存活 / 他人已清理 / 从未存在"三种情况响应逐字节一致。
+    _NOT_FOUND = Rejected(RejectReason.RUN_NOT_FOUND, "run not found")
 
-        - run 存在且属于 owner           -> 返回 run；
-        - run 属于他人 / 不存在且无墓碑   -> 统一 FORBIDDEN（404，不泄露存在性）；
-        - run 不存在但有自己的墓碑      -> RUN_PURGED（410，明确告知已被清理）。
-        关键：先查墓碑也要校验 owner，他人的墓碑同样返回 FORBIDDEN，
-        越权方无法区分"被清理"与"不存在"。
+    def _resolve_owned_run(self, owner: str, run_id: str) -> Run:
+        """解析 run 的可见性，语义严格区分：
+
+        - run 存在且属于 owner            -> 返回 run；
+        - run 不存在但有 owner 自己的墓碑 -> RUN_PURGED（410，明确告知已被清理）；
+        - 其他一切情况（属于他人 / 他人墓碑 / 从未存在）
+          -> 抛出同一个预构造的 RUN_NOT_FOUND 实例，响应完全一致，
+             越权方无法探测某条运行是否存在、属于谁、是否被清理。
         """
         run = self.storage.get_run(run_id)
         if run is not None:
             if run.owner != owner:
-                raise Rejected(RejectReason.FORBIDDEN,
-                               "run belongs to another owner")
+                raise self._NOT_FOUND
             return run
         tomb = self.storage.get_tombstone(run_id)
         if tomb is not None and tomb["owner"] == owner:
@@ -391,8 +395,8 @@ class Orchestrator:
                 extra={"purged_at": tomb["purged_at"],
                        "terminal_status": tomb["terminal_status"],
                        "reason": tomb["reason"]})
-        # 不存在，或墓碑属于他人：统一按越权/不存在处理，不泄露
-        raise Rejected(RejectReason.RUN_NOT_FOUND, run_id)
+        # 不存在，或墓碑属于他人：与越权完全同一响应，不泄露存在性
+        raise self._NOT_FOUND
 
     def _get_owned_run(self, owner: str, run_id: str) -> Run:
         return self._resolve_owned_run(owner, run_id)

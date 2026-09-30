@@ -273,11 +273,18 @@ def test_owner_isolation(make_orch):
         TaskSpec(name="a", handler="ok")]))
     orch.start()
     run = orch.trigger("alice", "w")
-    explain("输入: bob 读取 alice 的运行; 期望: FORBIDDEN（不泄露存在性）")
+    explain("输入: bob 读取 alice 的运行; 期望: 与'不存在'完全一致的 "
+            "RUN_NOT_FOUND（不泄露存在性）")
     with pytest.raises(Rejected) as ei:
         orch.get_run_view("bob", run.id)
-    explain(f"判定依据: reason={ei.value.reason}")
-    assert ei.value.reason == RejectReason.FORBIDDEN
+    explain(f"判定依据: reason={ei.value.reason} detail={ei.value.detail!r} "
+            f"extra={ei.value.extra}")
+    assert ei.value.reason == RejectReason.RUN_NOT_FOUND
+    # 与"从未存在"的响应逐项一致：reason/detail/extra 无任何差别
+    with pytest.raises(Rejected) as ei2:
+        orch.get_run_view("bob", "never-existed-id")
+    assert (ei2.value.reason, ei2.value.detail, ei2.value.extra) == \
+        (ei.value.reason, ei.value.detail, ei.value.extra)
     assert orch.storage.list_runs("bob") == []
     orch.stop()
 
